@@ -246,44 +246,93 @@ class IngestPipeline:
 
     # ---------- 数据流 4: event_type → dedup_filter → sample_job ----------
 
-    def dedup_events(self, records: list[EventRecord], dedup_fields: list[str]) -> list[EventRecord]:
+    def dedup_events(self, records: list[EventRecord], dedup_fields: list[str],
+                     window_minutes: int = 60) -> list[EventRecord]:
         """对事件记录集合执行去重过滤——对应 dedup_filter 模块。
 
-        使用 SHA256 指纹算法，基于指定的去重字段生成指纹。
+        使用 SHA256 指纹算法，基于指定的去重字段生成指纹；同一指纹只在
+        去重窗口内（按 event_time 时间差）判重，窗口外同指纹事件可再次保留。
         """
-        seen: set[str] = set()
+        seen: dict[str, list[datetime]] = {}
         unique: list[EventRecord] = []
+        window_seconds = window_minutes * 60
         for record in records:
             key_parts = [record.event_type.type_id]
             for field in sorted(dedup_fields):
                 val = record.parsed_fields.get(field, "")
                 key_parts.append(f"{field}={val}")
             fp = hashlib.sha256("|".join(key_parts).encode()).hexdigest()
-            if fp in seen:
+            retained_times = seen.setdefault(fp, [])
+            if any(abs((record.event_time - kept).total_seconds()) <= window_seconds
+                   for kept in retained_times):
                 continue
-            seen.add(fp)
+            retained_times.append(record.event_time)
             unique.append(record)
         return unique
 
     def sample_events(self, records: list[EventRecord], sample_ratio: float,
-                      merge_key: str = "") -> list[EventRecord]:
+                      merge_key: str = "",
+                      merge_window_minutes: int = 5) -> list[EventRecord]:
         """采样归并——对应 sample_job 模块。
 
-        按 sample_ratio 采样，按 merge_key 归并（同 key 仅保留最新）。
+        沿采样调用链去重扣额：按 merge_key + 归并时间窗归并代表，
+        同一代表（含重试/批量重复提交）只扣一次额度，已扣代表直接返回
+        既有样本而不重复扣费。
         """
-        sampled: list[EventRecord] = []
-        merged: dict[str, EventRecord] = {}
-        threshold = int(len(records) * sample_ratio)
-        for i, record in enumerate(records):
-            if merge_key:
-                mkey = record.parsed_fields.get(merge_key, "")
-                if mkey:
-                    merged[mkey] = record
-            if i < threshold:
-                sampled.append(record)
+        if not hasattr(self, "_sample_charged_reps"):
+            self._sample_charged_reps: dict[str, set[str]] = {}
+        if not hasattr(self, "_sample_merged_store"):
+            self._sample_merged_store: dict[str, EventRecord] = {}
+
         if merge_key:
-            return list(merged.values())
-        return sampled
+            merged: dict[str, EventRecord] = {}
+            for record in records:
+                mkey = record.parsed_fields.get(merge_key, "")
+                if not mkey:
+                    continue
+                minutes = record.event_time.minute - (record.event_time.minute % max(1, merge_window_minutes))
+                bucket = record.event_time.replace(minute=minutes, second=0, microsecond=0)
+                rep_key = f"{merge_key}:{bucket.isoformat()}"
+                existing = merged.get(rep_key)
+                if existing is None or record.event_time > existing.event_time:
+                    merged[rep_key] = record
+            # 名额按本次去重候选规模一次性确定，批量重试不会把门槛越缩越小
+            threshold = max(1, int(len(records) * sample_ratio))
+            charged = self._sample_charged_reps.setdefault(merge_key, set())
+            result: list[EventRecord] = []
+            for rep_key, record in merged.items():
+                if rep_key in charged:
+                    # 重试/批量重复：同一代表只扣一格，复用已交付样本
+                    result.append(self._sample_merged_store[rep_key])
+                    continue
+                if len(charged) >= threshold:
+                    # 名额已满：新代表本轮不扣额，但已扣代表仍需完整回放
+                    continue
+                charged.add(rep_key)
+                self._sample_merged_store[rep_key] = record
+                result.append(record)
+            return result
+
+        # 无归并键时按 record_id 幂等扣额
+        threshold = max(1, int(len(records) * sample_ratio))
+        charged_ids = self._sample_charged_reps.setdefault("__no_merge_key__", set())
+        result = []
+        for record in records:
+            if record.record_id in charged_ids:
+                result.append(record)
+                continue
+            if len(charged_ids) >= threshold:
+                continue
+            charged_ids.add(record.record_id)
+            result.append(record)
+        return result
+
+    def sample_charge_summary(self, merge_key: str) -> dict[str, int]:
+        """核对采样调用链实际扣额：每个归并代表只扣一格。"""
+        if not hasattr(self, "_sample_charged_reps"):
+            return {"charged_slots": 0, "representatives": 0}
+        charged = self._sample_charged_reps.get(merge_key, set())
+        return {"charged_slots": len(charged), "representatives": len(charged)}
 
     # ---------- 数据流 6: archive_policy → event_store ----------
 
